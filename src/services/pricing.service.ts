@@ -9,7 +9,7 @@
  * Every value here is SAR.
  */
 import { convertToSar } from "../shipping/shipping.calculator.js";
-import type { Draft, Product } from "../types/quote.js";
+import type { Currency, Draft, Product, QuoteType } from "../types/quote.js";
 import { roundUpToNearestTen } from "../utils/money.js";
 
 /** Below this combined products+shipping value the commission is the lower flat fee. */
@@ -22,6 +22,80 @@ const CUSTOMS_SERVICE_FEE_RATE = 0.0015;
 const CUSTOMS_SERVICE_FEE_MIN_SAR = 15;
 const CUSTOMS_SERVICE_FEE_MAX_SAR = 500;
 const VAT_RATE = 0.15;
+
+// Website defaults, used for the customs base only so the existing quote
+// totals and commission calculation remain unchanged.
+const WEBSITE_CURRENCY_RATES: Record<Currency, number> = {
+  USD: 3.75,
+  SAR: 1,
+  EUR: 4.05,
+  GBP: 4.75,
+  AUD: 2.45,
+  CAD: 2.7,
+  SGD: 2.8,
+};
+
+// Current website defaults for automatic MyUS restriction fees.
+const MYUS_DANGEROUS_GOODS_MIN_SAR = 112;
+const MYUS_DANGEROUS_GOODS_RATE = 0.08;
+const MYUS_INSTALLED_LITHIUM_FEE_SAR = 30;
+const MYUS_SPECIAL_PACKAGING_FEE_SAR = 90;
+
+type MyusExtraFeeCode = "dangerousGoods" | "installedLithiumBattery" | "specialPackaging";
+
+// Product rules that add MyUS fees on the website. Rules that only block a
+// carrier do not change the customs/tax base.
+const MYUS_EXTRA_FEE_RULES: readonly {
+  codes: readonly MyusExtraFeeCode[];
+  keywords: readonly string[];
+}[] = [
+  {
+    codes: ["dangerousGoods"],
+    keywords: [
+      "perfume", "fragrance", "cologne", "eau de parfum", "eau de toilette",
+      "alcohol based perfume", "acetone", "flammable liquid", "nail polish",
+      "عطر", "عطور", "برفيوم", "كولونيا", "أسيتون", "اسيتون",
+      "سائل قابل للاشتعال", "طلاء أظافر", "مناكير",
+    ],
+  },
+  {
+    codes: ["dangerousGoods"],
+    keywords: [
+      "glue", "adhesive", "silicone adhesive", "super glue", "epoxy",
+      "غراء", "لاصق", "مواد لاصقة", "سيليكون", "إيبوكسي", "ايبوكسي",
+    ],
+  },
+  {
+    codes: ["dangerousGoods", "specialPackaging"],
+    keywords: [
+      "paint", "paint thinner", "thinner", "paint remover", "turpentine", "varnish", "stain",
+      "دهان", "دهانات", "بوية", "تنر", "مزيل طلاء", "تربنتين", "ورنيش",
+    ],
+  },
+  {
+    codes: ["dangerousGoods"],
+    keywords: [
+      "aerosol", "spray", "hairspray", "hair spray", "spray sunscreen",
+      "spray-on sunscreen", "spray tan", "spray-on tan", "deodorant spray",
+      "بخاخ", "بخاخات", "سبراي", "مثبت شعر", "واقي شمس بخاخ", "بخاخ تسمير", "مزيل عرق بخاخ",
+    ],
+  },
+  {
+    codes: ["installedLithiumBattery"],
+    keywords: [
+      "lithium ion installed", "lithium battery installed", "built-in lithium battery",
+      "contains lithium battery", "device with lithium battery", "بطارية ليثيوم مركبة",
+      "بطارية مدمجة", "يحتوي على بطارية ليثيوم",
+    ],
+  },
+  {
+    codes: ["dangerousGoods"],
+    keywords: [
+      "loose lithium battery", "lithium battery", "lithium batteries", "power bank", "powerbank",
+      "بطارية ليثيوم", "بطاريات ليثيوم", "بطارية منفصلة", "باور بانك", "شاحن متنقل",
+    ],
+  },
+];
 
 /** Customs and VAT the customer pays to the carrier on delivery -- never part of the quote's final total. */
 export interface EstimatedTax {
@@ -47,24 +121,157 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
-/**
- * Assessed on the product value alone -- shipping and commission are
- * excluded, because customs values the goods, not the service around them.
- *
- * 1000 SAR -> duty 50 + fee 15 (the 1.5 raw fee lifted to its floor)
- *          -> VAT (1000 + 50 + 15) x 15% = 159.75
- *          -> 224.75 total
- */
-export function calculateEstimatedTax(productValue: number): EstimatedTax {
-  const customsDuty = productValue * CUSTOMS_DUTY_RATE;
-  const serviceFee = clamp(
-    productValue * CUSTOMS_SERVICE_FEE_RATE,
+function websiteCurrencyRate(currency: Currency | undefined): number {
+  return WEBSITE_CURRENCY_RATES[currency ?? "USD"];
+}
+
+function websiteProductValueSar(
+  product: Product,
+  index: number,
+  products: Product[],
+  quoteType: QuoteType
+): number {
+  const baseCurrency = products[0]?.currency ?? "USD";
+  const currency = quoteType === "single" && index > 0
+    ? baseCurrency
+    : product.currency ?? "USD";
+  const quantity = Math.max(1, product.quantity ?? 1);
+  return (product.price ?? 0) * websiteCurrencyRate(currency) * quantity;
+}
+
+function customsProductsValueSar(products: Product[], quoteType: QuoteType): number {
+  // The website excludes local shipping from customs and uses the first
+  // product's exchange rate for remaining products in a single-site quote.
+  return products.reduce(
+    (sum, product, index) => sum + websiteProductValueSar(product, index, products, quoteType),
+    0
+  );
+}
+
+function normalizeRuleText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[أإآ]/g, "ا")
+    .replace(/ى/g, "ي")
+    .replace(/ة/g, "ه")
+    .replace(/[\u064b-\u065f\u0670\u0640]/g, "")
+    .replace(/[\/_.?&=#%+:-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function automaticMyusExtraFeeSar(products: Product[], quoteType: QuoteType): number {
+  return products.reduce((sum, product, index) => {
+    // The website assesses only the first product for a single-site order.
+    if (quoteType === "single" && index > 0) return sum;
+
+    const productValue = websiteProductValueSar(product, index, products, quoteType);
+    const text = normalizeRuleText(`${product.name ?? ""} ${product.url} ${product.category ?? ""}`);
+    const feeCodes = new Set<MyusExtraFeeCode>();
+
+    for (const rule of MYUS_EXTRA_FEE_RULES) {
+      if (rule.keywords.some((keyword) => text.includes(normalizeRuleText(keyword)))) {
+        rule.codes.forEach((code) => feeCodes.add(code));
+      }
+    }
+
+    let productFee = 0;
+    for (const feeCode of feeCodes) {
+      if (feeCode === "dangerousGoods") {
+        productFee += Math.max(MYUS_DANGEROUS_GOODS_MIN_SAR, productValue * MYUS_DANGEROUS_GOODS_RATE);
+      } else if (feeCode === "installedLithiumBattery") {
+        productFee += MYUS_INSTALLED_LITHIUM_FEE_SAR;
+      } else {
+        productFee += MYUS_SPECIAL_PACKAGING_FEE_SAR;
+      }
+    }
+
+    return sum + productFee;
+  }, 0);
+}
+
+type CarrierTaxSource = "myus" | "shopship" | "other";
+
+function carrierTaxSource(draft: Draft): CarrierTaxSource {
+  const text = normalizeRuleText(
+    `${draft.shippingCompany ?? ""} ${draft.warehouseName ?? ""}`.replace(/&/g, " and ")
+  );
+
+  if (/shop\s*(?:and\s*)?ship|shopandship|shopship|شوب\s*اند\s*شيب/.test(text)) return "shopship";
+  if (text.includes("myus")) return "myus";
+  return "other";
+}
+
+function customsIncludesInternationalShipping(draft: Draft, source: CarrierTaxSource): boolean {
+  if (source === "shopship") return true;
+  if (source !== "myus") return false;
+
+  const carrierName = (draft.shippingCompany ?? "").toLowerCase();
+  return carrierName.includes("dhl") || carrierName.includes("aramex");
+}
+
+function customsServiceFee(amount: number): number {
+  if (amount <= 0) return 0;
+  return clamp(
+    amount * CUSTOMS_SERVICE_FEE_RATE,
     CUSTOMS_SERVICE_FEE_MIN_SAR,
     CUSTOMS_SERVICE_FEE_MAX_SAR
   );
-  const vat = (productValue + customsDuty + serviceFee) * VAT_RATE;
+}
 
-  return { customsDuty, serviceFee, vat, total: customsDuty + serviceFee + vat };
+function shopshipServiceFee(amount: number): number {
+  if (amount <= 0) return 0;
+  return amount < 1000 ? 3.75 : 35;
+}
+
+function customsTaxInputs(draft: Draft, quoteType: QuoteType): { amount: number; serviceFee: number } {
+  const productsValue = customsProductsValueSar(draft.products, quoteType);
+  const source = carrierTaxSource(draft);
+  const isIndirectShipping = draft.shippingMethod === "indirect";
+  const internationalShipping = isIndirectShipping ? draft.shippingPrice ?? 0 : 0;
+  const shopshipTaxableValue = source === "shopship" && isIndirectShipping
+    ? productsValue + internationalShipping
+    : 0;
+
+  let customsValueAddition = 0;
+  if (isIndirectShipping && customsIncludesInternationalShipping(draft, source)) {
+    customsValueAddition += internationalShipping;
+  }
+
+  if (isIndirectShipping && source === "myus") {
+    // The manually selected fee remains unchanged in the quote; it enters the
+    // customs base only for MyUS, as it does on the website.
+    const feeCurrency = draft.products[0]?.currency ?? "USD";
+    customsValueAddition += (draft.additionalFee ?? 0) * websiteCurrencyRate(feeCurrency);
+    customsValueAddition += automaticMyusExtraFeeSar(draft.products, quoteType);
+  }
+
+  const taxableAmount = Math.max(0, productsValue + customsValueAddition);
+  const nonShopshipTaxableAmount = Math.max(0, taxableAmount - shopshipTaxableValue);
+  return {
+    amount: taxableAmount,
+    serviceFee: customsServiceFee(nonShopshipTaxableAmount) + shopshipServiceFee(shopshipTaxableValue),
+  };
+}
+
+/**
+ * Mirrors the website's customs basis and service-fee branch. The optional
+ * override lets Shop & Ship use its shipment threshold instead of the
+ * standard percentage-based customs service fee.
+ */
+export function calculateEstimatedTax(taxableAmount: number, serviceFee: number | null = null): EstimatedTax {
+  if (taxableAmount <= 0) return { customsDuty: 0, serviceFee: 0, vat: 0, total: 0 };
+
+  const customsDuty = taxableAmount * CUSTOMS_DUTY_RATE;
+  const appliedServiceFee = serviceFee ?? customsServiceFee(taxableAmount);
+  const vat = (taxableAmount + customsDuty + appliedServiceFee) * VAT_RATE;
+
+  return {
+    customsDuty,
+    serviceFee: appliedServiceFee,
+    vat,
+    total: customsDuty + appliedServiceFee + vat,
+  };
 }
 
 /** Flat fee, stepped at 2000 SAR of products + shipping. */
@@ -114,14 +321,15 @@ export function calculateAdditionalFeeSar(draft: Draft): number {
  *
  * The additional fee is added ONCE, on top of the existing total. It does not
  * feed the commission threshold (kept on products+shipping) or the estimated
- * tax (kept on product value), so those calculations are unchanged.
+ * tax calculation other than the MyUS tax-base inclusion applied below.
  */
-export function calculateQuoteTotals(draft: Draft): QuoteTotals {
+export function calculateQuoteTotals(draft: Draft, quoteType: QuoteType = "single"): QuoteTotals {
   const productsTotal = calculateProductsTotalSar(draft.products);
   const shippingTotal = calculateShippingTotalSar(draft);
   const productsPlusShipping = productsTotal + shippingTotal;
   const commission = calculateCommission(productsPlusShipping);
   const additionalFee = calculateAdditionalFeeSar(draft);
+  const taxInputs = customsTaxInputs(draft, quoteType);
 
   return {
     productsTotal,
@@ -129,7 +337,7 @@ export function calculateQuoteTotals(draft: Draft): QuoteTotals {
     productsPlusShipping,
     commission,
     additionalFee,
-    estimatedTax: calculateEstimatedTax(productsTotal),
+    estimatedTax: calculateEstimatedTax(taxInputs.amount, taxInputs.serviceFee),
     finalTotal: productsPlusShipping + commission + additionalFee,
   };
 }

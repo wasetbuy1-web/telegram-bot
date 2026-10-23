@@ -162,9 +162,12 @@ function formatCustomerProducts(products: Product[]): string {
  * stated once, however many products the quote holds.
  */
 export function getCustomerQuoteText(session: SessionData): string {
-  const totals = calculateQuoteTotals(session.draft);
+  const totals = calculateQuoteTotals(session.draft, session.quoteType ?? "single");
   const productsSection = formatCustomerProducts(session.draft.products);
   const feeLine = additionalFeeLine(session.draft.additionalFeeType, session.draft.additionalFee);
+  const websiteRoundedTax = totals.estimatedTax.total > 0
+    ? Math.ceil(totals.estimatedTax.total / 10) * 10
+    : 0;
 
   return [
     "🛍️ عرض سعر الطلب",
@@ -173,7 +176,7 @@ export function getCustomerQuoteText(session: SessionData): string {
     `📋 العمولة: ${formatRiyal(totals.commission)}`,
     ...(feeLine ? [feeLine] : []),
     `✅ الإجمالي النهائي: ${formatRiyal(totals.finalTotal)}`,
-    `📦 الرسوم الضريبية التقديرية: ${formatRiyal(totals.estimatedTax.total)}`,
+    `📦 الرسوم الضريبية التقديرية: ${formatRiyal(websiteRoundedTax)}`,
     "تدفعها عند الاستلام من شركة الشحن.",
     `للتأكد استخدم حاسبة الرسوم الجمركية والضرائب:\n${ZATCA_CALCULATOR_URL}`,
   ].join("\n\n");
